@@ -1,0 +1,9 @@
+environment         = "dev"
+subscription_id     = "3d79666d-a060-4322-9f72-7291c9e8f743"
+location            = "westeurope"
+resource_group_name = "dev-two-tier-architecture"
+vnet_name           = "dev-vnet"
+address_space       = ["10.0.0.0/16"]
+public_subnet_cidr  = ["10.0.1.0/24"]
+private_subnet_cidr = ["10.0.2.0/24"]
+admin_username      = "azureuser"
