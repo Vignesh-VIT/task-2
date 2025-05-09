@@ -1,0 +1,279 @@
+name: 'terraform-azure-deployment'
+
+on:
+  push:
+    branches:
+      - qa         # Staging/QA
+      - feature/** # Development
+    paths:
+      - '**/*.tf'
+      - '**/*.tfvars'
+      - '.github/workflows/terraform-azure.yml'
+  pull_request:
+    branches:
+      - main
+      - qa            
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - qa
+          - prod
+
+run-name: "${{ github.ref_name }}.${{ github.sha }}.${{ github.workflow }}."
+
+env:
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_USE_CLI: false
+  TF_LOG: info
+
+jobs:
+  determine-environment:
+    name: 'Determine Target Environment'
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      is_pr: ${{ steps.set-env.outputs.is_pr }}
+    
+    steps:
+      - name: Set environment based on branch or workflow input
+        id: set-env
+        run: |
+          # Default to workflow input if provided
+          if [[ "${{ github.event.inputs.environment }}" != "" ]]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "is_pr=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Check if this is a pull request
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "is_pr=true" >> $GITHUB_OUTPUT
+            
+            # Set environment based on target branch of PR
+            if [[ "${{ github.base_ref }}" == "main" ]]; then
+              echo "environment=prod" >> $GITHUB_OUTPUT
+            elif [[ "${{ github.base_ref }}" == "qa" ]]; then
+              echo "environment=qa" >> $GITHUB_OUTPUT
+            else
+              echo "environment=dev" >> $GITHUB_OUTPUT
+            fi
+            
+            exit 0
+          fi
+          
+          # For direct push, determine environment based on branch name
+          echo "is_pr=false" >> $GITHUB_OUTPUT
+          
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref_name }}" == "qa" ]]; then
+            echo "environment=qa" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref_name }}" == feature/** ]] || [[ "${{ github.ref_name }}" == bug/** ]]; then
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          fi
+
+  terraform-verify:
+    name: 'Terraform Verify'
+    runs-on: ubuntu-latest
+    needs: determine-environment
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set subscription ID
+        run: |
+          cd terraform
+          SUBSCRIPTION_ID=$(grep subscription_id environments/${{ needs.determine-environment.outputs.environment }}/terraform.tfvars | cut -d'"' -f2 || echo "${{ secrets.AZURE_SUBSCRIPTION_ID }}")
+          echo "ARM_SUBSCRIPTION_ID=$SUBSCRIPTION_ID" >> $GITHUB_ENV
+
+      - name: Install tflint
+        run: |
+          curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+
+      - name: Terraform linting
+        id: lint
+        run: |
+          cd terraform
+          tflint --recursive --only=terraform_unused_declarations
+
+      - name: Terraform fmt check
+        id: fmt
+        run: |
+          cd terraform
+          terraform fmt -check -recursive
+        continue-on-error: false
+
+      - name: Terraform Init
+        id: init
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config=environments/${{ needs.determine-environment.outputs.environment }}/backend.tfvars \
+            -reconfigure
+
+      - name: Terraform Validate
+        id: validate
+        run: |
+          terraform validate -no-color
+
+  terraform-plan:
+    needs: [determine-environment, terraform-verify]
+    name: 'Terraform Plan'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine-environment.outputs.environment }}-plan
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set subscription ID
+        run: |
+          cd terraform
+          SUBSCRIPTION_ID=$(grep subscription_id environments/${{ needs.determine-environment.outputs.environment }}/terraform.tfvars | cut -d'"' -f2 || echo "${{ secrets.AZURE_SUBSCRIPTION_ID }}")
+          echo "ARM_SUBSCRIPTION_ID=$SUBSCRIPTION_ID" >> $GITHUB_ENV
+
+      - name: Terraform Init
+        id: init
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config=environments/${{ needs.determine-environment.outputs.environment }}/backend.tfvars \
+            -reconfigure
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd terraform
+          terraform plan \
+            -var-file=environments/${{ needs.determine-environment.outputs.environment }}/terraform.tfvars \
+            -var="public_key_path=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -out=tfplan
+        continue-on-error: false
+
+      - name: Upload Terraform Plan
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ needs.determine-environment.outputs.environment }}
+          path: terraform/tfplan
+          retention-days: 5
+
+      - name: Check Terraform Plan Status
+        if: steps.plan.outcome != 'success'
+        run: |
+          echo "Terraform plan failed. Please check the logs for more details."
+          exit 1
+
+      - name: Create Plan URL
+        id: create_plan_url
+        run: |
+          PLAN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}?check_suite_focus=true"
+          echo "plan_url=$PLAN_URL" >> $GITHUB_OUTPUT
+
+      - name: Send Teams notification
+        run: |
+          chmod +x ./scripts/send-teams-notification.sh
+          # Extract branch name from ref
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            BRANCH_NAME="$GITHUB_HEAD_REF"
+          else
+            BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+          fi
+          
+          echo "Branch name: $BRANCH_NAME"
+
+          ./scripts/send-teams-notification.sh \
+            "${{ secrets.MS_TEAMS_WEBHOOK_URL }}" \
+            "${{ job.status }}" \
+            "${{ github.repository }}" \
+            "$BRANCH_NAME" \
+            "${{ github.run_id }}" \
+            "${{ github.run_number }}" \
+            "${{ github.actor }}" \
+            "${{ steps.create_plan_url.outputs.plan_url }}"
+
+  terraform-apply:
+    needs: [determine-environment, terraform-plan]
+    name: 'Terraform Apply'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    
+    # Only run apply for:
+    # 1. Direct pushes to main, qa, feature/*, bug/*
+    # 2. Workflow dispatch
+    # Skip for pull requests (we only plan on PRs)
+    if: |
+      needs.determine-environment.outputs.is_pr == 'false' && 
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set subscription ID
+        run: |
+          cd terraform
+          SUBSCRIPTION_ID=$(grep subscription_id environments/${{ needs.determine-environment.outputs.environment }}/terraform.tfvars | cut -d'"' -f2 || echo "${{ secrets.AZURE_SUBSCRIPTION_ID }}")
+          echo "ARM_SUBSCRIPTION_ID=$SUBSCRIPTION_ID" >> $GITHUB_ENV
+
+      - name: Terraform Init
+        id: init
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config=environments/${{ needs.determine-environment.outputs.environment }}/backend.tfvars \
+            -reconfigure
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ needs.determine-environment.outputs.environment }}
+          path: terraform
+      
+      - name: Terraform Apply
+        id: apply
+        run: |
+          cd terraform
+          terraform apply -auto-approve tfplan
